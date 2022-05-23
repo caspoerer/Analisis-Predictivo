@@ -1,0 +1,982 @@
+---
+title: "Taller 2: Informe Análisis Predictivo"
+author: "Felipe Roman, Javier Correa, Mauricio Bustos, Carlos Spoerer"
+date: "Miércoles 19, Abril 2022"
+output:
+  rmdformats::readthedown:
+    theme: darkly
+    highlight: zenburn
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=FALSE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+# Pregunta 1  
+
+Metodología de Desarrollo de Modelos: Dividir tablas de entrenamiento y validación, realizar análisis descriptivo sobre base de entrenamiento, crear y transformar variables (en caso de categorizar, éstas deben ser mayor al 5%), transformar a woe, definir modelos tentativos, evaluar desempeño, definir punto de corte, etc. Entregar documentación, con interpretaciones y resultados en Word en formato PDF que detalle todo el proceso de modelamiento.  
+
+## Dataset
+
+-- Podemos obervar que no hay missing values  
+
+-- Vemos que hay una variable con categorías **Nivel de Educación**  
+
+-- Observamos los histogramas de todas las variables y vemos que la variable dependiente está relativamente balanceada, un poco más marcada en los casos Default == 1 con un promedio de 0.63.
+
+```{r DataSet Load, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(GGally)
+library(broom)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(readxl)
+library(kableExtra)
+library(knitr)
+library(skimr)
+library(reshape2) 
+library(sqldf)
+
+datos = "/Users/cspoerer/Desktop/Escritorio - Carlos’s MacBook Air/Estados Personales/MDS/Análisis Predictivo/Taller2/Trabajo Grupal N°2/Tabla Trabajo Grupal Nø2.xlsx"
+
+df = read_excel(path = datos, sheet = excel_sheets(datos)[1])
+
+#Transformamos a DataFrame
+df = data.frame(df)
+
+df %>% head() %>% kableExtra::kbl()
+
+skim(df)
+```
+
+**Ahora vemos la dimensión del Dataset:**  
+
+`r dim(df)[1]` filas  
+`r dim(df)[2]` columnas
+
+
+
+## Train y Validación
+
+-- Se divide el dataset en entrenamiento (train == 70%) y validacion (test == 30%)  
+
+-- Sacamos la variable ID_Cliente ya que no nos sirve.  
+
+-- Vemos que "Nivel_Educación" tiene variables categóricas:
+
+```{r train & test, message=FALSE, warning=FALSE, paged.print=FALSE}
+set.seed(102)
+
+train = df %>% slice_sample(prop = 0.7)
+
+test = df %>% anti_join(train)
+
+unique(train$Nivel_Educacional)
+
+train$SupCom = ifelse(train$Nivel_Educacional == "SupCom",1,0)
+train$Bas = ifelse(train$Nivel_Educacional == "Bas",1,0)
+train$Med = ifelse(train$Nivel_Educacional == "Med",1,0)
+train$SupInc = ifelse(train$Nivel_Educacional == "SupInc",1,0)
+train$Posg = ifelse(train$Nivel_Educacional == "Posg",1,0)
+
+test$SupCom = ifelse(test$Nivel_Educacional == "SupCom",1,0)
+test$Bas = ifelse(test$Nivel_Educacional == "Bas",1,0)
+test$Med = ifelse(test$Nivel_Educacional == "Med",1,0)
+test$SupInc = ifelse(test$Nivel_Educacional == "SupInc",1,0)
+test$Posg = ifelse(test$Nivel_Educacional == "Posg",1,0)
+
+#Se genera un nuevo dataset para ver la correlación con corrplot()
+train1 = train %>% select(-Nivel_Educacional)
+
+#train %>% select(-Nivel_Educacional) %>% ggpairs()
+
+```
+
+Para efectos del modelamiento las eliminaremos las variables Dummies, solo se quedan para el analisis de correlación por medio de gráfico.  
+
+-- Vemos otro resumen de nuestras variables:  
+
+**Podemos ver algunas variables con el mínimo valor == 0 lo cual deberemos corregir para la transformación log() que haremos en un modelo de regresión**
+
+```{r Summary, message=FALSE, warning=FALSE, paged.print=FALSE}
+summary(train1)
+```
+ 
+ 
+## Análisis de Datos  
+
+-- Se observan las correlaciones entre las variables, observandose una alta correlación entre Edad y Años_Trabajando (parece lógico)  
+
+-- Para los modelos consideraremos todas variables, aunque podriamos sacar la variable Ratio deuda/ingreso ya que está muy correlacionada con la variable Deuda Comercial.  
+
+-- Para el modelo de Cross Validation sacaremos la variable Ratio de nuestro Dataset. Se explicará más adelante.
+
+-- Notar que para efectos de la correlación eliminamos momentaneamenta la varible "Nivel_Educación".  
+
+-- Las variables Deudas~. poseen una correlación contraria a la variable Default.
+
+```{r Correlation, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(corrplot)
+library(RColorBrewer)
+
+M <-cor(train1)
+corrplot(M, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+
+Podemos visualizar que entre menos educación, el cliente es más propenso a no pagar:
+
+```{r tabla resumen Nivel de Educacion}
+train %>% group_by(Nivel_Educacional) %>% summarise("Promedio_Default"=mean(Default)) %>% arrange(desc(Promedio_Default)) %>%
+  kableExtra::kbl()
+```
+
+Se muestran los datos de los distintos niveles de educación e ingresos versus Default.
+
+```{r nivel de educación e ingresos vs Default}
+p <- ggplot(train, aes(Ingresos, Default)) + 
+  geom_point(data = transform(train, Nivel_Educacional = NULL), colour = "grey85")+
+  geom_point()+ 
+  facet_wrap(vars(Nivel_Educacional))
+p
+```
+
+Con los gráficos boxplot podemos observar los outliers de cada variable, para efectos de visualizacion dejamos afuera Ingresos y Ratio:
+
+```{r outliers, message=FALSE, warning=FALSE, paged.print=FALSE}
+df_long = melt(df %>% select(-Id_Cliente,-Nivel_Educacional,-Default, -Ingresos, -Ratio_Ingresos_Deudas))
+
+ggplot(df_long, aes(x = variable, y = value)) +           
+  geom_boxplot()
+```
+
+En estricto rigor debimos haber escalado las variables pero se podrán observar con mayor similitud, en cuanto a la escala, en el log()
+
+Se muestran gráficos con las distintas Deudas versus los Ingresos. Además, podemos visualizar la cantidad de Default por el tipo de nivel de educación y por su edad:  
+
+Estos gráficos permiten presentar variadas informaciones en poco espacio.  
+Podemos visualizar un mapa de Default == (0 ; 1) con distintas variables obteniendo información valiosa para la interpretación de nuestros resultados.
+
+```{r Crosstalk Graph, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(crosstalk)
+library(d3scatter)
+
+train_obj <- SharedData$new(train)
+bscols(widths = c(3,4,4,4),
+  list(
+    filter_checkbox("Default", "Default", train_obj, ~Default, inline = TRUE),
+    filter_slider("Edad", "Edad", train_obj, ~Edad, width = "100%"),filter_select("Nivel_Educacional","Nivel_Educacional:", train_obj, ~Nivel_Educacional, multiple=TRUE)),
+  d3scatter(train_obj, ~Ingresos, ~Deuda_Comercial, ~Default, width="100%", height=300),
+  d3scatter(train_obj, ~Ingresos, ~Deuda_Credito, ~Default, width="100%", height=300),
+  d3scatter(train_obj, ~Ingresos, ~Otras_Deudas, ~Default, width="100%", height=300)
+)
+```
+
+
+## Regresión Logística  
+
+Regresión Logística con las variables originales:  
+
+-- Vemos que glm() nos genera automáticamente la variable Nivel de Educación a variables dicotomicas  
+-- También vemos la correlación contraria de las variables Deudas ~. con la variable Default. Explicado en el gráfico de correlación.
+
+```{r regresion logistica, message=FALSE, warning=FALSE, paged.print=FALSE}
+train = train %>% select(-SupCom,-Bas,-Med,-SupInc,-Posg)
+test = test %>% select(-SupCom,-Bas,-Med,-SupInc,-Posg)
+
+modelo_original = train %>% select(-Id_Cliente) %>% glm(formula = Default ~ ., 
+                                                family = "binomial")
+summary(modelo_original)
+```
+
+Ahora generamos la tabla para encontrar el punto de corte  
+
+Mostramos un resumen de los primeros 3 y de los últimos 3 registros:  
+
+```{r train score, message=FALSE, warning=FALSE, paged.print=FALSE}
+train_score = train %>% mutate(score = predict(modelo_original, type = "response")) %>% 
+  count(score, Default) %>% 
+  pivot_wider(names_from = Default, values_from = n, values_fill = 0) %>% 
+  rename(cero = `0`, uno = `1`)
+train_score %>% head(3) %>% kableExtra::kbl()
+train_score %>% tail(3) %>% kableExtra::kbl()
+```
+
+
+```{r pto de corte, message=FALSE, warning=FALSE, paged.print=FALSE}
+pto_corte = train_score %>% mutate(accuracy = (cumsum(cero) + sum(uno) - cumsum(uno))/sum(cero + uno)) %>% 
+                arrange(desc(accuracy)) %>% 
+                slice(1) %>% 
+                pull(score) %>% 
+                unname
+```
+
+El punto de corte es el **`r round(pto_corte,2)`** esto quiere decir que los valores que tienen un score bajo **`r round(pto_corte,2)`**, los imputamos con "0" y los valores con score mayor a **`r round(pto_corte,2)`**, los imputamos con el "1".  
+
+En Resumen:  
+
+
+$$
+f(x)=
+\begin{cases}
+0 & \quad \text{cuando $score \leq `r round(pto_corte,2)`$}\\ 
+1 & \quad \text{de lo contrario}
+\end{cases}
+$$
+
+```{r matriz de confusión train, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_train = train %>% mutate(score = predict(modelo_original, type = "response"),
+                 pred_pto_corte = ifelse(score <= pto_corte, 0, 1)) %>% 
+          count(Default, pred_pto_corte) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_train %>% kableExtra::kbl()
+accuracy_train = (pred_train[1,2] + pred_train[2,3])/sum(pred_train[-1]) 
+```
+
+$$\text{$\dfrac{`r pred_train[1,2]`+`r pred_train[2,3]`}{`r sum(pred_train[-1])`}=`r accuracy_train[,1]` \:$   $\:$}$$
+Ahora lo haremos para el dataset de validación:
+
+
+```{r matriz de confusión test, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_test = test %>% mutate(score = predict(modelo_original, newdata = test, type = "response"),
+                 pred_pto_corte = ifelse(score <= pto_corte, 0, 1)) %>% 
+          count(Default, pred_pto_corte) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_test %>% kableExtra::kbl()
+accuracy_test = (pred_test[1,2] + pred_test[2,3])/sum(pred_test[-1]) 
+
+```
+
+$$\text{$\dfrac{`r pred_test[1,2]`+`r pred_test[2,3]`}{`r sum(pred_test[-1])`}=`r round(accuracy_test[,1],4)` \:$   $\:$}$$
+
+**Resultado:  **
+Vemos que la Accuracy, en el test de validación es `r round(accuracy_test[,1],4)` lo cual es mejor que `r round(accuracy_train[,1],4)` obtenida del entrenamiento.  
+
+
+```{r Resultados, message=FALSE, warning=FALSE, paged.print=FALSE}
+sensibilidad_train = pred_train[1,2]/sum(pred_train[,2])
+especificidad_train = pred_train[2,3]/sum(pred_train[,3])
+sensibilidad_test = pred_test[1,2]/sum(pred_test[,2])
+especificidad_test = pred_test[2,3]/sum(pred_test[,3])
+
+sensibilidad =c(sensibilidad_train[,1],sensibilidad_test[,1])
+especificidad = c(especificidad_train[,1],especificidad_test[,1])
+accuracy = c(accuracy_train[,1], accuracy_test[,1])
+datos = c("Entrenamiento", "Validación")
+
+resultados = data.frame(datos, accuracy, sensibilidad, especificidad)
+resultados %>% kableExtra::kbl()
+```
+
+
+
+## Regresión Logística Log()  
+
+Regresión Logística con las variables logarítmicas:
+
+```{r regresion logistica log, message=FALSE, warning=FALSE, paged.print=FALSE}
+train_log = train %>% 
+  mutate( Edad =ifelse(Edad ==0,1,Edad), Años_Trabajando=ifelse(Años_Trabajando==0,1,Años_Trabajando),Ingresos=ifelse(Ingresos==0,1,Ingresos),Deuda_Comercial=ifelse(Deuda_Comercial==0,1,Deuda_Comercial),Deuda_Credito=ifelse(Deuda_Credito==0,1,Deuda_Credito), Otras_Deudas=ifelse(Otras_Deudas==0,1,Otras_Deudas),Ratio_Ingresos_Deudas=ifelse(Ratio_Ingresos_Deudas==0,1,Ratio_Ingresos_Deudas) , Edad_log=log(Edad), Años_Trabajando_log=log(Años_Trabajando), 
+         Ingresos_log=log(Ingresos),Deuda_Comercial_log=log(Deuda_Comercial),
+         Deuda_Credito_log=log(Deuda_Credito),Otras_Deudas_log=log(Otras_Deudas),
+         Ratio_Ingresos_Deudas_log=log(Ratio_Ingresos_Deudas))
+
+test_log = test %>% 
+  mutate( Edad =ifelse(Edad ==0,1,Edad), Años_Trabajando=ifelse(Años_Trabajando==0,1,Años_Trabajando),Ingresos=ifelse(Ingresos==0,1,Ingresos),Deuda_Comercial=ifelse(Deuda_Comercial==0,1,Deuda_Comercial),Deuda_Credito=ifelse(Deuda_Credito==0,1,Deuda_Credito), Otras_Deudas=ifelse(Otras_Deudas==0,1,Otras_Deudas),Ratio_Ingresos_Deudas=ifelse(Ratio_Ingresos_Deudas==0,1,Ratio_Ingresos_Deudas) , Edad_log=log(Edad), Años_Trabajando_log=log(Años_Trabajando), 
+         Ingresos_log=log(Ingresos),Deuda_Comercial_log=log(Deuda_Comercial),
+         Deuda_Credito_log=log(Deuda_Credito),Otras_Deudas_log=log(Otras_Deudas),
+         Ratio_Ingresos_Deudas_log=log(Ratio_Ingresos_Deudas))
+
+formula = Default~ Edad_log+Años_Trabajando_log+Ingresos_log+Deuda_Comercial_log+Deuda_Credito_log+Otras_Deudas_log+Ratio_Ingresos_Deudas_log
+modelo_original_log = glm(formula, data = train_log, family = "binomial")
+summary(modelo_original_log)
+```
+
+Ahora vemos los outliers de nuestras variables aplicando Log():
+
+```{r boxplot log, message=FALSE, warning=FALSE, paged.print=FALSE}
+train_log_long = melt(train_log %>% select(-Id_Cliente,-Nivel_Educacional,-Default, -Ingresos, -Deuda_Credito,-Otras_Deudas,-Deuda_Comercial, -Edad, -Años_Trabajando,-Ratio_Ingresos_Deudas,-Ratio_Ingresos_Deudas_log))
+
+ggplot(train_log_long, aes(x = variable, y = value)) +           
+  geom_boxplot()
+```
+
+
+Ahora generamos la tabla para encontrar el punto de corte  
+
+Mostramos un resumen de los primeros 3 y de los últimos 3 registros:  
+
+```{r train score log, message=FALSE, warning=FALSE, paged.print=FALSE}
+train_score_log = train_log %>% mutate(score_log = predict(modelo_original_log, type = "response")) %>% 
+  count(score_log, Default) %>% 
+  pivot_wider(names_from = Default, values_from = n, values_fill = 0) %>% 
+  rename(cero = `0`, uno = `1`)
+train_score_log %>% head(3) %>% kableExtra::kbl()
+train_score_log %>% tail(3) %>% kableExtra::kbl()
+```
+
+
+```{r pto de corte log, message=FALSE, warning=FALSE, paged.print=FALSE}
+pto_corte_log = train_score_log %>% mutate(accuracy_log = (cumsum(cero) + sum(uno) - cumsum(uno))/sum(cero + uno)) %>% 
+                arrange(desc(accuracy_log)) %>% 
+                slice(1) %>% 
+                pull(score_log) %>% 
+                unname
+```
+
+El punto de corte es el **`r round(pto_corte_log,2)`** esto quiere decir que los valores que tienen un score bajo **`r round(pto_corte_log,2)`**, los imputamos con "0" y los valores con score mayor a **`r round(pto_corte_log,2)`**, los imputamos con el "1".  
+
+En Resumen:  
+
+
+$$
+f(x)=
+\begin{cases}
+0 & \quad \text{cuando $score \leq `r round(pto_corte_log,2)`$}\\ 
+1 & \quad \text{de lo contrario}
+\end{cases}
+$$
+
+```{r matriz de confusión train log, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_train_log = train_log %>% mutate(score_log = predict(modelo_original_log, type = "response"),
+                 pred_pto_corte_log = ifelse(score_log <= pto_corte_log, 0, 1)) %>% 
+          count(Default, pred_pto_corte_log) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_train_log %>% kableExtra::kbl()
+accuracy_train_log = (pred_train_log[1,2] + pred_train_log[2,3])/sum(pred_train_log[-1]) 
+```
+
+$$\text{$\dfrac{`r pred_train_log[1,2]`+`r pred_train_log[2,3]`}{`r sum(pred_train_log[-1])`}=`r accuracy_train_log[,1]` \:$   $\:$}$$
+Ahora lo haremos para el dataset de validación:
+
+
+```{r matriz de confusión test log, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_test_log = test_log %>% mutate(score_log = predict(modelo_original_log, newdata = test_log, type = "response"),
+                 pred_pto_corte_log = ifelse(score_log <= pto_corte_log, 0, 1)) %>% 
+          count(Default, pred_pto_corte_log) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_test_log %>% kableExtra::kbl()
+accuracy_test_log = (pred_test_log[1,2] + pred_test_log[2,3])/sum(pred_test_log[-1]) 
+
+```
+
+$$\text{$\dfrac{`r pred_test_log[1,2]`+`r pred_test_log[2,3]`}{`r sum(pred_test_log[-1])`}=`r round(accuracy_test_log[,1],4)` \:$   $\:$}$$
+
+**Resultado:  **
+Vemos que la Accuracy log(), en el test de validación es `r round(accuracy_test_log[,1],4)` lo cual es mejor que `r round(accuracy_train_log[,1],4)` obtenida del entrenamiento.  
+
+
+```{r Resultados log, message=FALSE, warning=FALSE, paged.print=FALSE}
+sensibilidad_train_log = pred_train_log[1,2]/sum(pred_train_log[,2])
+especificidad_train_log = pred_train_log[2,3]/sum(pred_train_log[,3])
+sensibilidad_test_log = pred_test_log[1,2]/sum(pred_test_log[,2])
+especificidad_test_log = pred_test_log[2,3]/sum(pred_test_log[,3])
+
+sensibilidad_log =c(sensibilidad_train_log[,1],sensibilidad_test_log[,1])
+especificidad_log = c(especificidad_train_log[,1],especificidad_test_log[,1])
+accuracy_log = c(accuracy_train_log[,1], accuracy_test_log[,1])
+datos_log = c("Entrenamiento", "Validación")
+
+resultados_log = data.frame(datos_log, accuracy_log, sensibilidad_log, especificidad_log)
+resultados_log %>% kableExtra::kbl()
+```
+
+
+
+## Cross Validation  
+
+Regresión Logística Cross Validation:  
+Esta regresión la haremos en python y pegaremos el código en este informe  
+
+-- Para este modelo ocuparemos una proporsión de 95% train y 5% de validation  
+
+-- Este tipo de modelo es muy usado para determinar "bloques" óptimos en nuestros datos  
+
+-- Solo para este modelos sacamos la variable Ratio deuda/ingreso ya que bajaba el accuracy. Tiene una correlación muy alta con Deuda Comercial y no vale la pena incorporarla.  
+
+
+![codigo python](/Users/cspoerer/Desktop/Escritorio - Carlos’s MacBook Air/Estados Personales/MDS/Análisis Predictivo/Taller2/codigo_python.png)
+
+Vemos que la matriz de confusión para el dataset de validación queda así:  
+
+$$\begin{bmatrix}
+306&23 \\
+68&103 \\
+\end{bmatrix}$$
+
+**Podemos ver los resultados en la imagen y ver que el accuracy es el sgte:**
+
+$$\text{$\dfrac{306+103}{500}=0.818 \:$   $\:$}$$  
+
+Primero las variables se estandarizaron con StandardScaler() y luego aplicamos una regresión logistica con Cross Validation.
+El proceso de ajuste optimiza los parámetros del modelo para que éste se ajuste a los datos de entrenamiento tan bien como pueda.
+
+
+
+
+## Arboles de Desición y WOE  
+Categorizar variables numericas mediante arboles de Decisión:  
+
+
+```{r Arboles de Decision, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(rpart)
+library(rpart.plot)
+
+arbol_edad = rpart(formula = Default~Edad, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4)
+rpart.plot(arbol_edad)
+```
+
+Para ver si encontramos más niveles en nuestros árboles, haremos un balanceo:  
+
+```{r Balanceo, message=FALSE, warning=FALSE, paged.print=FALSE}
+tasa =mean(train$Default)
+ponderador = tasa/(1-tasa)
+```
+
+Tasa = `r mean(train$Default)`  
+Ponderador = `r tasa/(1-tasa)`
+
+```{r arbol balanceado, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+train = train %>% mutate( peso = ifelse(Default == 0, ponderador,1))
+
+arbol_edad = rpart(formula = Default~Edad, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_edad)
+
+arbol_Años_Trabajando = rpart(formula = Default~Años_Trabajando, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Años_Trabajando)
+
+arbol_Ingresos = rpart(formula = Default~Ingresos, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Ingresos)
+
+arbol_Deuda_Comercial = rpart(formula = Default~Deuda_Comercial, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Deuda_Comercial)
+
+arbol_Deuda_Credito = rpart(formula = Default~Deuda_Credito, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Deuda_Credito)
+
+arbol_Otras_Deudas = rpart(formula = Default~Otras_Deudas, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Otras_Deudas)
+
+arbol_Ratio_Ingresos_Deudas = rpart(formula = Default~Ratio_Ingresos_Deudas, data = train[-1], control = rpart.control(minbucket = nrow(train)*0.05), maxdepth = 4, weights = peso)
+rpart.plot(arbol_Ratio_Ingresos_Deudas)
+```
+
+Agregamos nuevas variables a nuestro dataset con los nodos de cada una de las variables, quedando categorizadas:  
+**Mostramos los primeros registros del dataset**  
+
+```{r variables categóricas, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+train = train[-1]
+
+data_train = data.frame(train,
+                        "arbol_edad_nodo"=arbol_edad$where,
+                        "arbol_Años_Trabajando_nodo"=arbol_Años_Trabajando$where,
+                        "arbol_Ingresos_nodo"=arbol_Ingresos$where,
+                        "arbol_Deuda_Comercial_nodo"=arbol_Deuda_Comercial$where,
+                        "arbol_Deuda_Credito_nodo"=arbol_Deuda_Credito$where,
+                        "arbol_Otras_Deudas_nodo"=arbol_Otras_Deudas$where,
+                        "arbol_Ratio_Ingresos_Deudas_nodo"=arbol_Ratio_Ingresos_Deudas$where)
+
+data_train %>% head() %>% kableExtra::kbl()
+                        
+```
+
+Identificamos los WOE de cada uno de los nodos de las variables:  
+
+```{r WOE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+arbol_edad_WOE = data_train %>% group_by(arbol_edad_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_edad_WOE %>% kableExtra::kbl()
+
+arbol_Años_Trabajando_WOE = data_train %>% group_by(arbol_Años_Trabajando_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Años_Trabajando_WOE %>% kableExtra::kbl()
+
+arbol_Ingresos_WOE = data_train %>% group_by(arbol_Ingresos_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Ingresos_WOE %>% kableExtra::kbl()
+
+arbol_Deuda_Comercial_WOE = data_train %>% group_by(arbol_Deuda_Comercial_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Deuda_Comercial_WOE %>% kableExtra::kbl()
+
+arbol_Deuda_Credito_WOE = data_train %>% group_by(arbol_Deuda_Credito_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Deuda_Credito_WOE %>% kableExtra::kbl()
+
+arbol_Otras_Deudas_WOE = data_train %>% group_by(arbol_Otras_Deudas_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Otras_Deudas_WOE %>% kableExtra::kbl()
+
+arbol_Ratio_Ingresos_Deudas_WOE = data_train %>% group_by(arbol_Ratio_Ingresos_Deudas_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+arbol_Ratio_Ingresos_Deudas_WOE %>% kableExtra::kbl()
+```
+
+Ahora incorporamos los WOE correspondiente a cada nodo de las variables:  
+
+```{r incorporacion WOE a train, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+train_woe = data_train %>% left_join(arbol_edad_WOE %>% select(arbol_edad_nodo, WOE), 
+                                by = "arbol_edad_nodo") %>% 
+                      left_join(arbol_Años_Trabajando_WOE %>% select(arbol_Años_Trabajando_nodo, WOE),
+                                by = "arbol_Años_Trabajando_nodo") %>% 
+                      left_join(arbol_Ingresos_WOE %>% select(arbol_Ingresos_nodo, WOE),
+                                by = "arbol_Ingresos_nodo") %>% 
+                      left_join(arbol_Deuda_Comercial_WOE %>% select(arbol_Deuda_Comercial_nodo, WOE),
+                                by = "arbol_Deuda_Comercial_nodo") %>% 
+                      left_join(arbol_Deuda_Credito_WOE %>% select(arbol_Deuda_Credito_nodo, WOE),
+                                by = "arbol_Deuda_Credito_nodo") %>% 
+                      left_join(arbol_Otras_Deudas_WOE %>% select(arbol_Otras_Deudas_nodo, WOE),
+                                by = "arbol_Otras_Deudas_nodo") %>% 
+                      left_join(arbol_Ratio_Ingresos_Deudas_WOE %>% select(arbol_Ratio_Ingresos_Deudas_nodo, WOE),
+                                by = "arbol_Ratio_Ingresos_Deudas_nodo") %>% 
+  rename(arbol_edad_WOE=WOE.x,arbol_Años_Trabajando_WOE=WOE.y, arbol_Ingresos_WOE=WOE.x.x,
+         arbol_Deuda_Comercial_WOE=WOE.y.y, arbol_Deuda_Credito_WOE=WOE.x.x.x, arbol_Otras_Deudas_WOE=WOE.y.y.y,
+         arbol_Ratio_Ingresos_Deudas_WOE=WOE)
+train_woe %>% head() %>% kableExtra::kbl()
+
+```
+
+```{r Predicción WOE, message=FALSE, warning=FALSE, paged.print=FALSE}
+formula = Default~arbol_edad_WOE+arbol_Años_Trabajando_WOE+arbol_Ingresos_WOE+arbol_Deuda_Comercial_WOE+
+  arbol_Deuda_Credito_WOE+arbol_Otras_Deudas_WOE+arbol_Ratio_Ingresos_Deudas_WOE+Nivel_Educacional
+prediccion = glm(formula, data = train_woe, family = "binomial")
+summary(prediccion)
+```
+
+```{r train score woe, message=FALSE, warning=FALSE, paged.print=FALSE}
+train_score_WOE = train %>% mutate(score = predict(prediccion, type = "response")) %>% 
+  count(score, Default) %>% 
+  pivot_wider(names_from = Default, values_from = n, values_fill = 0) %>% 
+  rename(cero = `0`, uno = `1`)
+train_score_WOE %>% head(3) %>% kableExtra::kbl()
+train_score_WOE %>% tail(3) %>% kableExtra::kbl()
+```
+
+```{r pto de corte woe, message=FALSE, warning=FALSE, paged.print=FALSE}
+pto_corte_woe = train_score_WOE %>% mutate(accuracy = (cumsum(cero) + sum(uno) - cumsum(uno))/sum(cero + uno)) %>% 
+                arrange(desc(accuracy)) %>% 
+                slice(1) %>% 
+                pull(score) %>% 
+                unname
+```
+
+El punto de corte es el **`r round(pto_corte_woe,2)`** esto quiere decir que los valores que tienen un score bajo **`r round(pto_corte_woe,2)`**, los imputamos con "0" y los valores con score mayor a **`r round(pto_corte_woe,2)`**, los imputamos con el "1".  
+
+
+```{r matriz de confusión train woe, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_train_woe = train %>% mutate(score = predict(prediccion, type = "response"),
+                 pred_pto_corte_woe = ifelse(score <= pto_corte_woe, 0, 1)) %>% 
+          count(Default, pred_pto_corte_woe) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_train_woe %>% kableExtra::kbl()
+accuracy_train_woe = (pred_train_woe[1,2] + pred_train_woe[2,3])/sum(pred_train_woe[-1]) 
+```
+
+$$\text{$\dfrac{`r pred_train_woe[1,2]`+`r pred_train_woe[2,3]`}{`r sum(pred_train_woe[-1])`}=`r accuracy_train_woe[,1]` \:$   $\:$}$$
+
+Ahora haremos las mismas transformaciones a nuestra base de testeo:  
+
+```{r Balanceo test, message=FALSE, warning=FALSE, paged.print=FALSE}
+tasa =mean(test$Default)
+ponderador = tasa/(1-tasa)
+```
+
+Tasa_test = `r mean(train$Default)`  
+Ponderador_test = `r tasa/(1-tasa)`  
+
+```{r arbol balanceado test, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+test = test %>% mutate( peso = ifelse(Default == 0, ponderador,1))
+
+arbol_edad = rpart(formula = Default~Edad, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Años_Trabajando = rpart(formula = Default~Años_Trabajando, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Ingresos = rpart(formula = Default~Ingresos, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Deuda_Comercial = rpart(formula = Default~Deuda_Comercial, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Deuda_Credito = rpart(formula = Default~Deuda_Credito, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Otras_Deudas = rpart(formula = Default~Otras_Deudas, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+
+arbol_Ratio_Ingresos_Deudas = rpart(formula = Default~Ratio_Ingresos_Deudas, data = test[-1], control = rpart.control(minbucket = nrow(test)*0.05), maxdepth = 4, weights = peso)
+```
+
+
+Agregamos nuevas variables a nuestro dataset con los nodos de cada una de las variables, quedando categorizadas:  
+**Mostramos los primeros registros del dataset**  
+
+```{r variables categóricas test, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+test = test[-1]
+
+data_test = data.frame(test,
+                        "arbol_edad_nodo"=arbol_edad$where,
+                        "arbol_Años_Trabajando_nodo"=arbol_Años_Trabajando$where,
+                        "arbol_Ingresos_nodo"=arbol_Ingresos$where,
+                        "arbol_Deuda_Comercial_nodo"=arbol_Deuda_Comercial$where,
+                        "arbol_Deuda_Credito_nodo"=arbol_Deuda_Credito$where,
+                        "arbol_Otras_Deudas_nodo"=arbol_Otras_Deudas$where,
+                        "arbol_Ratio_Ingresos_Deudas_nodo"=arbol_Ratio_Ingresos_Deudas$where)
+
+data_test %>% head() %>% kableExtra::kbl()
+                        
+```
+
+
+```{r WOE test, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+arbol_edad_WOE = data_test %>% group_by(arbol_edad_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Años_Trabajando_WOE = data_test %>% group_by(arbol_Años_Trabajando_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Ingresos_WOE = data_test %>% group_by(arbol_Ingresos_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Deuda_Comercial_WOE = data_test %>% group_by(arbol_Deuda_Comercial_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Deuda_Credito_WOE = data_test %>% group_by(arbol_Deuda_Credito_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Otras_Deudas_WOE = data_test %>% group_by(arbol_Otras_Deudas_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+
+arbol_Ratio_Ingresos_Deudas_WOE = data_test %>% group_by(arbol_Ratio_Ingresos_Deudas_nodo) %>% 
+  summarise("positivos" = sum(Default*peso),"totales"=sum(peso),
+            "WOE"=log(sum(Default*peso/(sum(peso)-sum(Default*peso)))) )
+```
+
+Ahora incorporamos los WOE correspondiente a cada nodo de las variables:  
+
+```{r incorporacion WOE a test, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+test_woe = data_test %>% left_join(arbol_edad_WOE %>% select(arbol_edad_nodo, WOE), 
+                                by = "arbol_edad_nodo") %>% 
+                      left_join(arbol_Años_Trabajando_WOE %>% select(arbol_Años_Trabajando_nodo, WOE),
+                                by = "arbol_Años_Trabajando_nodo") %>% 
+                      left_join(arbol_Ingresos_WOE %>% select(arbol_Ingresos_nodo, WOE),
+                                by = "arbol_Ingresos_nodo") %>% 
+                      left_join(arbol_Deuda_Comercial_WOE %>% select(arbol_Deuda_Comercial_nodo, WOE),
+                                by = "arbol_Deuda_Comercial_nodo") %>% 
+                      left_join(arbol_Deuda_Credito_WOE %>% select(arbol_Deuda_Credito_nodo, WOE),
+                                by = "arbol_Deuda_Credito_nodo") %>% 
+                      left_join(arbol_Otras_Deudas_WOE %>% select(arbol_Otras_Deudas_nodo, WOE),
+                                by = "arbol_Otras_Deudas_nodo") %>% 
+                      left_join(arbol_Ratio_Ingresos_Deudas_WOE %>% select(arbol_Ratio_Ingresos_Deudas_nodo, WOE),
+                                by = "arbol_Ratio_Ingresos_Deudas_nodo") %>% 
+  rename(arbol_edad_WOE=WOE.x,arbol_Años_Trabajando_WOE=WOE.y, arbol_Ingresos_WOE=WOE.x.x,
+         arbol_Deuda_Comercial_WOE=WOE.y.y, arbol_Deuda_Credito_WOE=WOE.x.x.x, arbol_Otras_Deudas_WOE=WOE.y.y.y,
+         arbol_Ratio_Ingresos_Deudas_WOE=WOE)
+test_woe %>% head() %>% kableExtra::kbl()
+
+```
+
+```{r matriz de confusión test woe, message=FALSE, warning=FALSE, paged.print=FALSE}
+pred_test_woe = test_woe %>% mutate(score = predict(prediccion, newdata = test_woe, type = "response"),
+                 pred_pto_corte_woe = ifelse(score <= pto_corte_woe, 0, 1)) %>% 
+          count(Default, pred_pto_corte_woe) %>% 
+          pivot_wider(names_from = Default, values_from = n)
+pred_test_woe %>% kableExtra::kbl()
+accuracy_test_woe = (pred_test_woe[1,2] + pred_test_woe[2,3])/sum(pred_test_woe[-1]) 
+
+```
+
+**Resultado:  **  
+
+Vemos que la Accuracy, en el test de validación es `r round(accuracy_test_woe[,1],4)` lo cual es mejor que `r round(accuracy_train_woe[,1],4)` obtenida del entrenamiento.  
+
+```{r Resultados Arbol, message=FALSE, warning=FALSE, paged.print=FALSE}
+sensibilidad_train_woe = pred_train_woe[1,2]/sum(pred_train_woe[,2])
+especificidad_train_woe = pred_train_woe[2,3]/sum(pred_train_woe[,3])
+sensibilidad_test_woe = pred_test_woe[1,2]/sum(pred_test_woe[,2])
+especificidad_test_woe = pred_test_woe[2,3]/sum(pred_test_woe[,3])
+
+sensibilidad_woe =c(sensibilidad_train_woe[,1],sensibilidad_test_woe[,1])
+especificidad_woe = c(especificidad_train_woe[,1],especificidad_test_woe[,1])
+accuracy_woe = c(accuracy_train_woe[,1], accuracy_test_woe[,1])
+datos = c("Entrenamiento", "Validación")
+
+resultados_woe = data.frame(datos, accuracy_woe, sensibilidad_woe, especificidad_woe)
+resultados_woe %>% kableExtra::kbl()
+```
+
+
+## Kmeans  
+
+Para Kmeans, buscaremos las segmentaciones por cada uno de las variables.  
+Luego imputaremos el AVG(Default) para cada segmentación. Lo haremos agrupando.  
+
+**Para la predicción de Train obtenemos el siguiente resumen:**  
+
+```{r Kmeans train, message=FALSE, warning=FALSE, paged.print=FALSE}
+kmedias <- kmeans(x = train[,1], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = as.numeric(train$Default))
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Edad_kmedias_target <- sqldf("select b.media as Edad_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,3], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Años_Trabajando_kmedias_target <- sqldf("select b.media as Años_Trabajando_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,4], centers = 2, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Ingresos_kmedias_target <- sqldf("select b.media as Ingresos_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,5], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Deuda_Comercial_kmedias_target <- sqldf("select b.media as Deuda_Comercial_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,6], centers = 2, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Deuda_Credito_kmedias_target <- sqldf("select b.media as Deuda_Credito_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,7], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Otras_Deudas_kmedias_target <- sqldf("select b.media as Otras_Deudas_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = train[,8], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = train$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Ratio_Ingresos_Deudas_kmedias_target <- sqldf("select b.media as Ratio_Ingresos_Deudas_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+datos_kmedias <- data.frame(Edad_kmedias_target,Años_Trabajando_kmedias_target,Ingresos_kmedias_target
+                            ,Deuda_Comercial_kmedias_target,Deuda_Credito_kmedias_target,Otras_Deudas_kmedias_target
+                            ,Ratio_Ingresos_Deudas_kmedias_target)
+
+datos_kmedias_target <- data.frame(datos_kmedias,train$Nivel_Educacional, "Default" = train$Default)
+
+formula <- Default  ~ .
+
+modelo_kmedias <- glm(formula, data = datos_kmedias_target)
+summary(modelo_kmedias)
+
+
+train_score_kmeans = datos_kmedias_target %>% mutate(score = predict(modelo_kmedias, type = "response")) %>% 
+  count(score, Default) %>% 
+  pivot_wider(names_from = Default, values_from = n, values_fill = 0) %>% 
+  rename(cero = `0`, uno = `1`)
+
+pto_corte_kmeans = train_score_kmeans %>% mutate(accuracy = (cumsum(cero) + sum(uno) - cumsum(uno))/sum(cero + uno)) %>% 
+  arrange(desc(accuracy)) %>% 
+  slice(1) %>% 
+  pull(score) %>% 
+  unname
+
+pred_train_kmeans = datos_kmedias_target %>% mutate(score = predict(modelo_kmedias, type = "response"),
+                                  pred_pto_corte_kmeans = ifelse(score <= pto_corte_kmeans, 0, 1)) %>% 
+  count(Default, pred_pto_corte_kmeans) %>% 
+  pivot_wider(names_from = Default, values_from = n)
+accuracy_train_kmeans = (pred_train_kmeans[1,2] + pred_train_kmeans[2,3])/sum(pred_train_kmeans[-1]) 
+```
+
+
+**Para la predicción de Train obtenemos el siguiente resumen:**  
+
+```{r Kmeans test, message=FALSE, warning=FALSE, paged.print=FALSE}
+kmedias <- kmeans(x = test[,1], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = as.numeric(test$Default))
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Edad_kmedias_target <- sqldf("select b.media as Edad_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,3], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Años_Trabajando_kmedias_target <- sqldf("select b.media as Años_Trabajando_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,4], centers = 2, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Ingresos_kmedias_target <- sqldf("select b.media as Ingresos_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,5], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Deuda_Comercial_kmedias_target <- sqldf("select b.media as Deuda_Comercial_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,6], centers = 2, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Deuda_Credito_kmedias_target <- sqldf("select b.media as Deuda_Credito_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,7], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Otras_Deudas_kmedias_target <- sqldf("select b.media as Otras_Deudas_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+kmedias <- kmeans(x = test[,8], centers = 5, nstart = 50)
+cluster <- data.frame("cluster" = kmedias$cluster, "df" = test$Default)
+parametros_cluster <-sqldf("select cluster, avg(df) as media from cluster group by cluster")
+Ratio_Ingresos_Deudas_kmedias_target <- sqldf("select b.media as Ratio_Ingresos_Deudas_kmedias_target from cluster a inner join parametros_cluster b on a.cluster=b.cluster")
+
+datos_kmedias_test <- data.frame(Edad_kmedias_target,Años_Trabajando_kmedias_target,Ingresos_kmedias_target
+                            ,Deuda_Comercial_kmedias_target,Deuda_Credito_kmedias_target,Otras_Deudas_kmedias_target
+                            ,Ratio_Ingresos_Deudas_kmedias_target)
+
+datos_kmedias_test <- data.frame(datos_kmedias_test,test$Nivel_Educacional, "Default" = test$Default)
+
+formula <- Default  ~ .
+
+modelo_kmedias_test <- glm(formula, data = datos_kmedias_test)
+summary(modelo_kmedias_test)
+
+
+test_score_kmeans = datos_kmedias_test %>% mutate(score = predict(modelo_kmedias_test, type = "response")) %>% 
+  count(score, Default) %>% 
+  pivot_wider(names_from = Default, values_from = n, values_fill = 0) %>% 
+  rename(cero = `0`, uno = `1`)
+
+pto_corte_kmeans = test_score_kmeans %>% mutate(accuracy = (cumsum(cero) + sum(uno) - cumsum(uno))/sum(cero + uno)) %>% 
+  arrange(desc(accuracy)) %>% 
+  slice(1) %>% 
+  pull(score) %>% 
+  unname
+
+pred_test_kmeans = datos_kmedias_test %>% mutate(score = predict(modelo_kmedias_test, type = "response"),
+                                                    pred_pto_corte_kmeans = ifelse(score <= pto_corte_kmeans, 0, 1)) %>% 
+  count(Default, pred_pto_corte_kmeans) %>% 
+  pivot_wider(names_from = Default, values_from = n)
+accuracy_test_kmeans = (pred_test_kmeans[1,2] + pred_test_kmeans[2,3])/sum(pred_test_kmeans[-1]) 
+
+```
+
+**Resultados Kmeans: **  
+
+```{r Resultados Kmeans, message=FALSE, warning=FALSE, paged.print=FALSE}
+sensibilidad_train_kmeans = pred_train_kmeans[1,2]/sum(pred_train_kmeans[,2])
+especificidad_train_kmeans = pred_train_kmeans[2,3]/sum(pred_train_kmeans[,3])
+sensibilidad_test_kmeans = pred_test_kmeans[1,2]/sum(pred_test_kmeans[,2])
+especificidad_test_kmeans = pred_test_kmeans[2,3]/sum(pred_test_kmeans[,3])
+
+sensibilidad_kmeans =c(sensibilidad_train_kmeans[,1],sensibilidad_test_kmeans[,1])
+especificidad_kmeans = c(especificidad_train_kmeans[,1],especificidad_test_kmeans[,1])
+accuracy_kmeans = c(accuracy_train_kmeans[,1], accuracy_test_kmeans[,1])
+datos = c("Entrenamiento", "Validación")
+
+resultados_kmeans = data.frame(datos, accuracy_kmeans, sensibilidad_kmeans, especificidad_kmeans)
+resultados_kmeans %>% kableExtra::kbl()
+```
+
+
+
+## Resultados finales  
+
+**Resultados Finales:**  
+
+-- Vemos que la mejor predicción nos entrega el modelo Cross Validation.  
+-- No hay mucha diferencia entre el resto de los modelos. 
+-- En la pregunta N2 se obtiene un Accuracy mayor a todos los anteriores con XGboost que será explicado en la misma pregunta N2.
+
+```{r resultados finales, message=FALSE, warning=FALSE, paged.print=FALSE}
+data.frame(datos,accuracy, accuracy_log, "accuracy_CV"=c(0.766, 0.818), accuracy_woe, accuracy_kmeans) %>% kable() %>% kable_styling()
+```
+
+
+
+
+
+# Pregunta 2  
+
+Champion Challenger: A partir del modelo, entregar en la pestaña validación, la predicción del modelo del campo default (valores 0 o 1). Entre todos los grupos entregados, se evaluará con el mejor puntaje al grupo que cuente con la mayor tasa de correcta clasificación (Accuracy). El punto para los demás grupos será proporcional a lo cercano que fue la predicción sobre ese “limite” (3 ptos).
+
+## XGboost  
+
+Para la predicción del nuevo dataset utilizaremos el modelo de XGboost a través de Python  
+
+Para la incorporación de este modelo se descidio realizar una transformación log() y luego analizar los outliers y sacarlos utilizando el siguiente filtro:  
+
+**IQR = Q3 - Q1**
+
+Por lo tanto el IQR de cada variable queda:
+
+Id_Cliente                  4999.500000  
+Edad                          18.000000  
+Años_Trabajando               10.000000  
+Ingresos                       0.842183  
+Deuda_Comercial                0.923164  
+Deuda_Credito                  0.815614  
+Otras_Deudas                   0.974291  
+Ratio_Ingresos_Deudas          0.265703  
+Default                        1.000000  
+Nivel_Educacional_Med          1.000000  
+Nivel_Educacional_Posg         0.000000  
+Nivel_Educacional_SupCom       0.000000  
+Nivel_Educacional_SupInc       0.000000  
+dtype: float64  
+
+Luego dividimos el modelo con la misma función que utilizamos en el modelo de Cross Validation.
+
+Despues de realizar el split(test_size = 20%), entrenamos al modelo con XGBClassifier() y aplicamos la matriz de confusión al set de validación quedando de esta manera:
+
+
+$$\begin{bmatrix}
+282&38 \\
+13&578 \\
+\end{bmatrix}$$
+
+**Podemos ver los resultados en la imagen y ver que el accuracy es el sgte:**
+
+$$\text{$\dfrac{282+578}{911}=0.944 \:$   $\:$}$$  
+
+A contianuación se puede observar una parte del código utilizado para la obtención del accuracy:  
+
+![codigo python XGboost](/Users/cspoerer/Desktop/Escritorio - Carlos’s MacBook Air/Estados Personales/MDS/Análisis Predictivo/Taller2/codigo_python_xgboost.png)
+
+A continuación se puede visualizar el dataset con los datos de la variable dependiente completos.  
+**ojo: se puede descagar en .xls**
+```{r}
+library(DT)
+
+datos = "/Users/cspoerer/Desktop/Escritorio - Carlos’s MacBook Air/Estados Personales/MDS/Análisis Predictivo/Taller2/predicc_XGB.xlsx"
+
+read_excel(path = datos) %>% DT::datatable(rownames = FALSE, filter = "top", extensions = "Buttons",
+            options = list(dom = "Bfrtip", 
+                           buttons = c("excel", "pdf")))
+
+
+```
+
+
+Tambien dejamos el código para ver el desarrollo del modelo:  
+
+
+
